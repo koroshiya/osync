@@ -359,7 +359,12 @@ function GetLocalOS {
 
 	case $local_os_var in
 		*"Linux"*)
-		LOCAL_OS="Linux"
+		local is_busybox_bionic=$(busybox | grep "bionic")
+		if [[ ${#is_busybox_bionic} -gt 0 ]]; then
+			LOCAL_OS="Cyanogen" #AFAIK, only Cyanogen ships with BBB by default
+		else
+			LOCAL_OS="Linux"
+		fi
 		;;
 		*"BSD"*)
 		LOCAL_OS="BSD"
@@ -411,7 +416,18 @@ function GetRemoteOS {
 
 		case $remote_os_var in
 			*"Linux"*)
-			REMOTE_OS="Linux"
+
+			local cmd=$SSH_CMD' "busybox | grep bionic" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+			Logger "cmd: $cmd" "DEBUG"
+			eval "$cmd" &
+			WaitForTaskCompletion $! 120 240 $FUNCNAME"-3"
+			retval=$?
+			if [ $retval == 0 ] && [ ${#retval} -gt 0 ]; then
+				REMOTE_OS="Cyanogen"
+			else
+				REMOTE_OS="Linux"
+			fi
+
 			;;
 			*"BSD"*)
 			REMOTE_OS="BSD"
@@ -890,6 +906,31 @@ function InitRemoteOSSettings {
         else
                 REMOTE_FIND_CMD=find
         fi
+}
+
+function ConvertSpaceUnits {
+	__CheckArguments 0 $# $FUNCNAME "$@"	#__WITH_PARANOIA_DEBUG
+
+	num=$1
+	unit="${num: -1}"
+	num="${num:0:-1}"
+
+	case $unit in
+		"K")
+		awk -v num="$num" 'BEGIN{printf "%.0f",  num * 1024}'
+		;;
+		"M")
+		awk -v num="$num" 'BEGIN{printf "%.0f",  num * 1024 * 1024}'
+		;;
+		"G")
+		awk -v num="$num" 'BEGIN{printf "%.0f",  num * 1024 * 1024 * 1024}'
+		;;
+		*)
+		echo $1
+		;;
+	esac
+
+	return 0
 }
 
 ## END Generic functions

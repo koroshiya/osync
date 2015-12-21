@@ -252,7 +252,11 @@ function _CheckDiskSpaceLocal {
 
 	Logger "Checking minimum disk space in [$replica_path]." "NOTICE"
 
-	local initiator_space=$(df -P "$replica_path" | tail -1 | awk '{print $4}')
+	if [ "$LOCAL_OS" == "Cyanogen" ]; then
+		local initiator_space=$(busybox df -P "$replica_path" | tail -1 | awk '{print $4}')
+	else
+		local initiator_space=$(df -P "$replica_path" | tail -1 | awk '{print $4}')
+	fi
 	if [ $initiator_space -lt $MINIMUM_SPACE ]; then
 		Logger "There is not enough free space on initiator [$initiator_space KB]." "WARN"
 	fi
@@ -267,7 +271,13 @@ function _CheckDiskSpaceRemote {
 	CheckConnectivity3rdPartyHosts
 	CheckConnectivityRemoteHost
 
-	cmd=$SSH_CMD' "'$COMMAND_SUDO' df -P \"'$replica_path'\"" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+	if [ "$REMOTE_OS" == "Cyanogen" ]; then
+		local DF_CMD="busybox df -P"
+	else
+		local DF_CMD="df -P"
+	fi
+
+	cmd=$SSH_CMD' "'$COMMAND_SUDO' '$DF_CMD' \"'$replica_path'\"" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
 	Logger "cmd: $cmd" "DEBUG"
 	eval "$cmd" &
 	WaitForTaskCompletion $! 720 1800 $FUNCNAME
@@ -276,6 +286,9 @@ function _CheckDiskSpaceRemote {
 		Logger "Command output:\n$(cat $RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID)" "NOTICE"
 	else
 		local target_space=$(cat $RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID | tail -1 | awk '{print $4}')
+		if [ "$REMOTE_OS" == "Cyanogen" ]; then
+			target_space=$(ConvertSpaceUnits $target_space)
+		fi
 		if [ $target_space -lt $MINIMUM_SPACE ]; then
 			Logger "There is not enough free space on target [$replica_path]." "WARN"
 		fi
@@ -1136,6 +1149,8 @@ function _SoftDeleteRemote {
 	local replica_type="${1}"
 	local replica_deletion_path="${2}" # Contains the full path to softdelete / backup directory without ending slash
 	local change_time="${3}"
+	local rlink=$(readlink -f "$0")
+	local cur_dir=$(dirname "$rlink")
 	__CheckArguments 3 $# $FUNCNAME "$@"	#__WITH_PARANOIA_DEBUG
 
 	CheckConnectivity3rdPartyHosts
@@ -1148,15 +1163,92 @@ function _SoftDeleteRemote {
 	fi
 
 	if [ $_VERBOSE -eq 1 ]; then
-		# Cannot launch log function from xargs, ugly hack
-		cmd=$SSH_CMD' "if [ -w \"'$replica_deletion_path'\" ]; then '$COMMAND_SUDO' '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type f -ctime +'$change_time' -print0 | xargs -0 -I {} echo Will delete file {} && '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type d -empty -ctime '$change_time' -print0 | xargs -0 -I {} echo Will delete directory {}; else echo \"Directory not writable\"; return 1; fi" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+		if [ "$REMOTE_OS" == "Cyanogen" ]; then
+			cmd=<<"EOF"
+				if [ -w "$replica_deletion_path" ]; then
+					busybox ls -lce "$replica_deletion_path" | while read ls_output;
+					do
+						ls_output=($ls_output);
+						if [[ ${#ls_output[6]} -gt 0 ]]; then
+							month=$(expr index "JanFebMarAprMayJunJulAugSepOctNovDec" ${ls_output[6]});
+							month=$((($month + 2) / 3));
+							ctime=$(printf "%s.%d.%s-%s" ${ls_output[9]} $month ${ls_output[7]} ${ls_output[8]});
+							ctime=$(busybox date -d $ctime +%s);
+							ctime=$(($ctime / 86400));
+							now=$(busybox date +%s);
+							now=$((now / 86400));
+							days=$((now - ctime));
+							if [[ $days -gt $change_time ]]; then
+								echo "$days have passed";
+								filename=${ls_output[@]:10};
+								if [[ -w "$filename" ]]; then
+									if [[ -f "$filename" ]]; then
+										echo "found file";
+									elif [[ -d "$filename" ]]; then
+										len=$(busybox ls -A "$filename" | head -1);
+										if [[ ${#len} -gt 0 ]]; then
+											echo "Will delete directory $filename";
+										fi;
+									else
+										echo "Will delete file $filename";
+									fi;
+								fi;
+							fi;
+						fi;
+					done;
+				else
+					echo "Replica path $replica_deletion_path not writable";
+				fi
+EOF
+			cmd=$(printf '%s COMMAND_SUDO="%s"; replica_deletion_path="%s"; change_time=%d; %s' "$SSH_CMD" "$COMMAND_SUDO" "$replica_deletion_path" $change_time "$cmd")
+		else
+			# Cannot launch log function from xargs, ugly hack
+			cmd=$SSH_CMD' "if [ -w \"'$replica_deletion_path'\" ]; then '$COMMAND_SUDO' '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type f -ctime +'$change_time' -print0 | xargs -0 -I {} echo Will delete file {} && '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type d -empty -ctime '$change_time' -print0 | xargs -0 -I {} echo Will delete directory {}; else echo \"Directory not writable\"; return 1; fi" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+		fi
 		Logger "cmd: $cmd" "DEBUG"
 		eval "$cmd" &
 		Logger "Command output:\n$(cat $RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID)" "NOTICE"
 	fi
 
 	if [ $_DRYRUN -ne 1 ]; then
-		cmd=$SSH_CMD' "if [ -w \"'$replica_deletion_path'\" ]; then '$COMMAND_SUDO' '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type f -ctime +'$change_time' -print0 | xargs -0 -I {} rm -f \"{}\" && '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type d -empty -ctime '$change_time' -print0 | xargs -0 -I {} rm -rf \"{}\"; else echo \"Directory not writable\"; return 1; fi" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+		if [ "$REMOTE_OS" == "Cyanogen" ]; then
+			cmd=<<"EOF"
+				if [ -w "$replica_deletion_path" ]; then
+					busybox ls -lce "$replica_deletion_path" | while read ls_output;
+					do
+						ls_output=($ls_output);
+						if [[ ${#ls_output[6]} -gt 0 ]]; then
+							month=$(expr index "JanFebMarAprMayJunJulAugSepOctNovDec" ${ls_output[6]});
+							month=$((($month + 2) / 3));
+							ctime=$(printf "%s.%d.%s-%s" ${ls_output[9]} $month ${ls_output[7]} ${ls_output[8]});
+							ctime=$(busybox date -d $ctime +%s);
+							ctime=$(($ctime / 86400));
+							now=$(busybox date +%s);
+							now=$((now / 86400));
+							days=$((now - ctime));
+							if [[ $days -gt $change_time ]]; then
+								filename=${ls_output[@]:10};
+								if [[ -w "$filename" ]]; then
+									if [[ -f "$filename" ]]; then
+										rm -f "$filename";
+									elif [[ -d "$filename" ]]; then
+										len=$(busybox ls -A "$filename" | head -1);
+										if [[ ${#len} -gt 0 ]]; then
+											rm -rf "$filename";
+										fi;
+									fi;
+								fi;
+							fi;
+						fi;
+					done;
+				else
+					echo "$replica_deletion_path not writable";
+				fi
+EOF
+			cmd=$(printf '%s COMMAND_SUDO="%s"; replica_deletion_path="%s"; change_time=%d; %s' "$SSH_CMD" "$COMMAND_SUDO" "$replica_deletion_path" $change_time "$cmd")
+		else
+			cmd=$SSH_CMD' "if [ -w \"'$replica_deletion_path'\" ]; then '$COMMAND_SUDO' '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type f -ctime +'$change_time' -print0 | xargs -0 -I {} rm -f \"{}\" && '$REMOTE_FIND_CMD' \"'$replica_deletion_path'/\" -type d -empty -ctime '$change_time' -print0 | xargs -0 -I {} rm -rf \"{}\"; else echo \"Directory not writable\"; return 1; fi" > "'$RUN_DIR/$PROGRAM.$FUNCNAME.$SCRIPT_PID'" 2>&1'
+		fi
 		Logger "cmd: $cmd" "DEBUG"
 		eval "$cmd" &
 	else
